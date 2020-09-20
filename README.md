@@ -12,7 +12,7 @@ The purpose of this project is to promote the research and application of semi-s
 
 As a result, the SSL algorithms integrated in PixelSSL are compatible with all task codes inherited from the given template. 
 
-This project includes the code of our ECCV 2020 paper [Guided Collaborative Training for Pixel-wise Semi-Supervised Learning](https://arxiv.org/abs/2008.05258) (GCT).
+<!-- This project includes the code of our ECCV 2020 paper [Guided Collaborative Training for Pixel-wise Semi-Supervised Learning](https://arxiv.org/abs/2008.05258) (GCT). -->
 
 ## News
 - **[Sep 16 2020] PixelSSL v0.1.1 is Released!**  
@@ -31,8 +31,8 @@ This project includes the code of our ECCV 2020 paper [Guided Collaborative Trai
 
 ## Supported Algorithms and Tasks
 We are actively updating this project.  
-The algorithms and demo tasks supported by PixelSSL are summarized in the following table: 
-| SSL/Tasks | [Segmentation](task/sseg) | Other Tasks | 
+The SSL algorithms and demo tasks supported by PixelSSL are summarized in the following table: 
+| Algorithms / Tasks | [Segmentation](task/sseg) | Other Tasks | 
 | :---: | :---: | :---: |
 | SupOnly | v0.1.0 | Coming Soon |
 | [MT](https://arxiv.org/abs/1703.01780) | v0.1.0 | Coming Soon |
@@ -40,6 +40,12 @@ The algorithms and demo tasks supported by PixelSSL are summarized in the follow
 | [AdvSSL](https://arxiv.org/abs/1802.07934) | v0.1.0 | Coming Soon |
 | [GCT](https://arxiv.org/abs/2008.05258) | v0.1.0 | Coming Soon |
 
+
+The corresponding papers of SSL methods in the above table:    
+- **[MT](https://arxiv.org/abs/1703.01780)** - Mean Teachers are Better Role Models: Weight-Averaged Consistency Targets Improve Semi-Supervised Deep Learning Results
+- **[S4L](https://arxiv.org/abs/1905.03670)** - S4L: Self-Supervised Semi-Supervised Learning
+- **[AdvSSL](https://arxiv.org/abs/1802.07934)** - Adversarial Learning for Semi-supervised Semantic Segmentation
+- **[GCT](https://arxiv.org/abs/2008.05258)** - Guided Collaborative Training for Pixel-wise Semi-Supervised Learning
 
 ## Installation
 Please refer to the [Installation](docs/installation.md) document.  
