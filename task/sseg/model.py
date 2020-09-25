@@ -67,7 +67,7 @@ class DeepLab(pixelssl.model_template.TaskModel):
 class DeepLabV2(DeepLab):
     def __init__(self, args):
 
-        if self.args.backbone != 'resnet101':
+        if args.backbone != 'resnet101':
             pixelssl.log_err('Currnently, the DeepLabV2 architecture only supports ResNet-101 backbone\n'
                              'since the COCO pretraining is used by default.\n'
                              'You can support more backbones for DeepLabV2 in the file \'task/sseg/model.py\'\n')
