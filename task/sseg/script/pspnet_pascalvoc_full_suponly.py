@@ -12,22 +12,17 @@ except ImportError:
 
 import proxy
 
+
 config = collections.OrderedDict(
     [
         ('exp_id', os.path.basename(__file__).split(".")[0]),
         
         # arguments - SSL algorithm
-        ('ssl_algorithm', pixelssl.SSL_MT),
-
-        ('cons_for_labeled', False),
-        ('cons_scale', 1.0),
-        ('cons_rampup_epochs', 3),
-        
-        ('ema_decay', 0.99),
+        ('ssl_algorithm', pixelssl.SSL_NULL),
 
         # arguments - exp
-        ('resume', 'pretrained/deeplabv2_pascalvoc_1-8_sslmt.ckpt'),
-        ('validation', True),
+        # ('resume', ''),
+        # ('validation', True),
         
         ('out_path', 'result'),
         
@@ -45,31 +40,28 @@ config = collections.OrderedDict(
         ('num_workers', 2),
         ('im_size', 321),
 
-        ('sublabeled_path', 'dataset/PascalVOC/sublabeled_prefix/1-8/0.txt'),
-        ('ignore_unlabeled', False),
-
         # arguments - task specific components
-        ('models', {'model': 'deeplabv2'}),
+        ('models', {'model': 'pspnet'}),
         ('optimizers', {'model': 'sgd'}),
         ('lrers', {'model': 'polynomiallr'}),
         ('criterions', {'model': 'sseg_criterion'}),
-
+        
         # arguments - task specific optimizer / lr scheduler
         ('lr', 0.00025),
         ('momentum', 0.9),
         ('weight_decay', 0.0005),
 
         # arguments - task special model
-        ('output_stride', 16),
-        ('backbone', 'resnet101'),
+        ('output_stride', 8),
+        ('backbone', 'resnet50'),
 
         # arguments - task special data
-        ('reduce_val_res', True),
+        ('reduce_val_res', False),
 
         # arguments - training details
-        ('epochs', 20),
+        ('epochs', 50),
         ('batch_size', 4),
-        ('unlabeled_batch_size', 2), 
+        ('unlabeled_batch_size', 0), 
 
     ]
 )
