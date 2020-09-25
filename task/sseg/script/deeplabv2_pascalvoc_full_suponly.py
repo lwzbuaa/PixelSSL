@@ -57,6 +57,7 @@ config = collections.OrderedDict(
 
         # arguments - task special data
         ('reduce_val_res', True),
+        ('pascalvoc_base_size', 400),
 
         # arguments - training details
         ('epochs', 40),

@@ -21,6 +21,7 @@ def add_parser_arguments(parser):
                         help='sseg - if true, the short edge of the outputs is scaled ' 
                              'to the size of the inputs, and the long edge is scaled by '
                              'using the same ratio')
+    parser.add_argument('--pascalvoc-base-size', type=int, default=400, help='')
 
 
 def pascal_voc_aug():
@@ -91,9 +92,9 @@ class PascalVocDataset(pixelssl.data_template.TaskDataset):
         else:
             sample = {self.IMAGE: image, self.LABEL: label}
         composed_transforms = transforms.Compose([
+            RandomScaleCrop(base_size=self.args.pascalvoc_base_size, crop_size=self.args.im_size),
             RandomHorizontalFlip(),
-            RandomScaleCrop(base_size=self.args.im_size, crop_size=self.args.im_size),
-            RandomGaussianBlur(),
+            # RandomGaussianBlur(),
             Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensor()])
 
