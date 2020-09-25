@@ -68,6 +68,8 @@ class SSLMT(ssl_base._SSLBase):
         self.s_lrer = None
         self.s_criterion = None
 
+        self.cons_criterion = None
+        
         self.gaussian_noiser = None
         self.zero_tensor = torch.zeros(1)
 

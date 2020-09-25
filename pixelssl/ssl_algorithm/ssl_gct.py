@@ -19,7 +19,7 @@ from pixelssl.nn.module import patch_replication_callback, SynchronizedBatchNorm
 from . import ssl_base
 
 
-""" Implementation of Guided Collaborative Training (GCT) for pixel-wise semi-supervised learning
+""" Implementation of the GCT algorithm for SSL
 
 This method is proposed in paper:
     'Guided Collaborative Training for Pixel-wise Semi-Supervised Learning'
