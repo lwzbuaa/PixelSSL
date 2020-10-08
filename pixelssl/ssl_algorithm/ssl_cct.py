@@ -1,23 +1,69 @@
 import os
+import cv2
 import time
+import math
 import random
 import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.autograd import Variable
+from torch.distributions.uniform import Uniform
 
 from pixelssl.utils import REGRESSION, CLASSIFICATION
-from pixelssl.utils import logger, tool
+from pixelssl.utils import logger, tool, cmd
 from pixelssl.nn import func
 from pixelssl.nn.module import patch_replication_callback
 
 from . import ssl_base
 
 
+""" Implementation of the CCT algorithm for SSL
+
+This method is proposed in paper:
+    'Semi-Supervised Semantic Segmentation with Cross-Consistency Training' 
+
+This implementation follows the official code from: https://github.com/yassouali/CCT
+Since the code of the auxilary decoders are adapted from the aforementioned repository, 
+they may only suitable for semantic segmentation. For  consistency constraint calculation, 
+this code supports both sigmoid ramp-up scale function and MSE loss, which are suitable for 
+most tasks.
+"""
+
+
 def add_parser_arguments(parser):
     ssl_base.add_parser_arguments(parser)
 
+    parser.add_argument('--cons-scale', type=float, default=-1, help='consistency constraint coefficient')
+    parser.add_argument('--cons-rampup-epochs', type=int, default=-1, help='ramp-up epochs of conistency constraint')
+    
+    parser.add_argument('--ad-lr-scale', type=float, default=-1, help='learning rate scale for auxilary decoders')
+
+    # TODO
+    parser.add_argument('--ad-in-channels', type=int, default=2048, help='')
+    parser.add_argument('--ad-out-channels', type=int, default=21, help='')
+    parser.add_argument('--ad-upscale', type=int, default=8, help='')
+
+    parser.add_argument('--vat_dec_num', type=int, default=2, help='')
+    parser.add_argument('--vat_dec_xi', type=float, default=1e-6, help='')
+    parser.add_argument('--vat_dec_eps', type=float, default=2.0, help='')
+
+    parser.add_argument('--drop_dec_num', type=int, default=6, help='')
+    parser.add_argument('--drop_dec_rate', type=float, default=0.5, help='')
+    parser.add_argument('--drop_dec_spatial', type=cmd.str2bool, default=True, help='')
+
+    parser.add_argument('--cut_dec_num', type=int, default=6, help='')
+    parser.add_argument('--cut_dec_erase', type=float, default=0.4, help='')
+
+    parser.add_argument('--context-dec-num', type=int, default=2, help='')
+
+    parser.add_argument('--object-dec-num', type=int, default=2, help='')
+
+    parser.add_argument('--fd-dec-num', type=int, default=6, help='')
+
+    parser.add_argument('--fn-dec-num', type=int, default=6, help='')
+    parser.add_argument('--fn-dec-uniform', type=float, default=0.3, help='')
 
 
 def ssl_cct(args, model_dict, optimizer_dict, lrer_dict, criterion_dict, task_func):
@@ -39,6 +85,7 @@ def ssl_cct(args, model_dict, optimizer_dict, lrer_dict, criterion_dict, task_fu
 
 class SSLCCT(ssl_base._SSLBase):
     NAME = 'ssl_cct'
+    # TODO: support the regression tasks
     SUPPORTED_TASK_TYPES = [CLASSIFICATION]
 
     def __init__(self, args):
@@ -55,43 +102,58 @@ class SSLCCT(ssl_base._SSLBase):
         self.cons_criterion = None
 
         # check SSL arguments
+        if self.args.unlabeled_batch_size > 0:
+            if self.args.cons_scale < 0:
+                logger.log_err('The argument - cons_scale - is not set (or invalid)\n'
+                               'You set argument - unlabeled_batch_size - larger than 0\n'
+                               'Please set - cons_scale >= 0 - for training\n')
+            elif self.args.cons_rampup_epochs < 0:
+                logger.log_err('The argument - cons_rampup_epochs - is not set (or invalid)\n'
+                               'You set argument - unlabeled_batch_size - larger than 0\n'
+                               'Please set - cons_rampup_epochs >= 0 - for training\n')
+            if self.args.ad_lr_scale < 0:
+                logger.log_err('The argument - ad_lr_scale - is not set (or invalid)\n'
+                               'You set argument - unlabeled_batch_size - larger than 0\n'
+                               'Please set - ad_lr_scale >= 0 - for training\n')
+        else:
+            self.args.ad_lr_scale = 0
 
-    def __build__(self, model_funcs, optimizer_funcs, lrer_funcs, criterion_funcs, task_func):
+        # TODO: check arguments for the auxilary decoders
+
+    def _build(self, model_funcs, optimizer_funcs, lrer_funcs, criterion_funcs, task_func):
         self.task_func = task_func
 
         # create the main task model
         self.main_model = func.create_model(model_funcs[0], 'main_model', args=self.args).module
         
         # create the auxilary decoders
-        ad_upscale, ad_in_channels, ad_out_channels = self.task_func.sslcct_ad_arguments() # TODO:
-
         vat_decoders = [
-            VATDecoder(ad_upscale, ad_in_channels, ad_out_channels, xi=self.args.vat_dec_xi, eps=self.args.vat_dec_eps) \
+            VATDecoder(self.args.ad_upscale, self.args.ad_in_channels, self.args.ad_out_channels, xi=self.args.vat_dec_xi, eps=self.args.vat_dec_eps) \
                 for _ in range(0, self.args.vat_dec_num)
         ]
         drop_decoders = [
-            DropOutDecoder(ad_upscale, ad_in_channels, ad_out_channels, drop_rate=self.args.drop_dec_rate, spatial_dropout=self.args.drop_dec_spatial) \
+            DropOutDecoder(self.args.ad_upscale, self.args.ad_in_channels, self.args.ad_out_channels, drop_rate=self.args.drop_dec_rate, spatial_dropout=self.args.drop_dec_spatial) \
                 for _ in range(0, self.args.drop_dec_num)
         ]
         cut_decoders = [
-            CutOutDecoder(ad_upscale, ad_in_channels, ad_out_channels, erase=self.args.cut_dec_erase) \
-                for _ in range(0, self.cut_dec_num)
+            CutOutDecoder(self.args.ad_upscale, self.args.ad_in_channels, self.args.ad_out_channels, erase=self.args.cut_dec_erase) \
+                for _ in range(0, self.args.cut_dec_num)
         ]
         context_decoders = [
-            ContextMaskingDecoder(ad_upscale, ad_in_channels, ad_out_channels) \
+            ContextMaskingDecoder(self.args.ad_upscale, self.args.ad_in_channels, self.args.ad_out_channels) \
                 for _ in range(0, self.args.context_dec_num)
         ]
         object_decoders = [
-            ObjectMaskingDecoder(ad_upscale, ad_in_channels, ad_out_channels) \
+            ObjectMaskingDecoder(self.args.ad_upscale, self.args.ad_in_channels, self.args.ad_out_channels) \
                 for _ in range(0, self.args.object_dec_num)
         ]
         feature_drop_decoders = [
-            FeatureDropDecoder(ad_upscale, ad_in_channels, ad_out_channels) \
+            FeatureDropDecoder(self.args.ad_upscale, self.args.ad_in_channels, self.args.ad_out_channels) \
                 for _ in range(0, self.args.fd_dec_num)
         ]
         feature_noise_decoders = [
-            FeatureNoiseDecoder(ad_upscale, ad_in_channels, ad_out_channels, uniform_range=self.args.fn_dec_uniform) \
-                for _ in range(0, self.args.fdn_dec_num)
+            FeatureNoiseDecoder(self.args.ad_upscale, self.args.ad_in_channels, self.args.ad_out_channels, uniform_range=self.args.fn_dec_uniform) \
+                for _ in range(0, self.args.fn_dec_num)
         ]
 
         self.auxilary_decoders = nn.ModuleList(
@@ -101,7 +163,6 @@ class SSLCCT(ssl_base._SSLBase):
         # wrap 'self.main_model' and 'self.auxilary decoders' into a single model
         self.model = WrappedCCTModel(self.args, self.main_model, self.auxilary_decoders)
         self.model = nn.DataParallel(self.model).cuda()
-
         # call 'patch_replication_callback' to use the `sync_batchnorm` layer
         patch_replication_callback(self.model)
         self.models = {'model': self.model}
@@ -115,24 +176,199 @@ class SSLCCT(ssl_base._SSLBase):
         self.lrers = {'lrer': self.lrer}
 
         # create criterions
-        self.criterion = criterion_funcs[0](self.args)
         # TODO: support more types of the consistency criterion
         self.cons_criterion = nn.MSELoss()
+        self.criterion = criterion_funcs[0](self.args)
         self.criterions = {'criterion': self.criterion, 'cons_criterion': self.cons_criterion}
 
         self._algorithm_warn()
 
-    
     def _train(self, data_loader, epoch):
-        pass
+        self.meters.reset()
+        lbs = self.args.labeled_batch_size
+
+        self.model.train()
+
+        for idx, (inp, gt) in enumerate(data_loader):
+            timer = time.time()
+
+            inp, gt = self._batch_prehandle(inp, gt)
+            if len(gt) > 1 and idx == 0:
+                self._data_err()
+
+            # TODO: support more ramp-up functions
+            # calculate the ramp-up coefficient of the consistency constraint
+            cur_step = len(data_loader) * epoch + idx
+            total_steps = len(data_loader) * self.args.cons_rampup_epochs
+            cons_rampup_scale = func.sigmoid_rampup(cur_step, total_steps)
+
+            self.optimizer.zero_grad()
+
+            # forward the wrapped CCT model
+            resulter, debugger = self.model.forward(inp, is_train=True)
+            pred = tool.dict_value(resulter, 'pred')
+            activated_pred = tool.dict_value(resulter, 'activated_pred')
+            ad_preds = tool.dict_value(resulter, 'ad_preds')
+
+            # calculate the supervised task loss on the labeled data
+            l_pred = func.split_tensor_tuple(pred, 0, lbs)
+            l_gt = func.split_tensor_tuple(gt, 0, lbs)
+            l_inp = func.split_tensor_tuple(inp, 0, lbs)
+
+            task_loss = self.criterion.forward(l_pred, l_gt, l_inp)
+            task_loss = torch.mean(task_loss)
+            self.meters.update('task_loss', task_loss.data)
+
+            # -----------------------------------------------------------
+            # For Unlabeled Data
+            # -----------------------------------------------------------
+            if self.args.unlabeled_batch_size > 0:
+                # prepare the groud truth for the consistency loss
+                ul_activated_pred = func.split_tensor_tuple(activated_pred, lbs, self.args.batch_size)
+                ul_ad_gt = ul_activated_pred[0].detach()
+                # prepare the predictions from the auxilary decoders
+                ad_preds = [F.interpolate(ad_pred, size=(ul_ad_gt.shape[2], ul_ad_gt.shape[3]), mode='bilinear') for ad_pred in ad_preds]
+                ul_ad_preds = func.split_tensor_tuple(ad_preds, lbs, self.args.batch_size)
+                ul_activated_ad_preds = self.task_func.sslcct_activate_ad_preds(ul_ad_preds)
+                # calculate the consisntecy loss
+                cons_loss = sum([self.cons_criterion.forward(ul_activated_ad_pred, ul_ad_gt) for ul_activated_ad_pred in ul_activated_ad_preds])
+                cons_loss = cons_rampup_scale * self.args.cons_scale * torch.mean(cons_loss) / len(ul_activated_ad_preds)
+                self.meters.update('cons_loss', cons_loss.data)
+            else:
+                cons_loss = 0
+                self.meters.update('cons_loss', cons_loss)
+
+            # backward and update the wrapped CCT model
+            loss = task_loss + cons_loss
+            loss.backward()
+            self.optimizer.step()
+
+            # logging
+            self.meters.update('batch_time', time.time() - timer)
+            if idx % self.args.log_freq == 0:
+                logger.log_info('step: [{0}][{1}/{2}]\tbatch-time: {meters[batch_time]:.3f}\n'
+                                '  task-{3}\t=>\t'
+                                'task-loss: {meters[task_loss]:.6f}\t'
+                                'cons-loss: {meters[cons_loss]:.6f}\n'
+                                .format(epoch, idx, len(data_loader), self.args.task, meters=self.meters))
+
+            # visualization
+            if self.args.visualize and idx % self.args.visual_freq == 0:
+                self._visualize(epoch, idx, True, 
+                                func.split_tensor_tuple(inp, 0, 1, reduce_dim=True),
+                                func.split_tensor_tuple(activated_pred, 0, 1, reduce_dim=True),
+                                func.split_tensor_tuple(gt, 0, 1, reduce_dim=True))
+
+            # update iteration-based lrers
+            if not self.args.is_epoch_lrer:
+                self.lrer.step()
+        
+        # update epoch-based lrers
+        if self.args.is_epoch_lrer:
+            self.lrer.step()
 
     def _validate(self, data_loader, epoch):
-        pass
+        self.meters.reset()
+
+        self.model.eval()
+
+        for idx, (inp, gt) in enumerate(data_loader):
+            timer = time.time()
+
+            inp, gt = self._batch_prehandle(inp, gt)
+            if len(gt) > 1 and idx == 0:
+                self._data_err()
+            
+            resulter, debugger = self.model.forward(inp, is_train=False)
+            pred = tool.dict_value(resulter, 'pred')
+            activated_pred = tool.dict_value(resulter, 'activated_pred')
+
+            task_loss = self.criterion.forward(pred, gt, inp)
+            task_loss = torch.mean(task_loss)
+            self.meters.update('task_loss', task_loss.data)
+
+            self.task_func.metrics(activated_pred, gt, inp, self.meters, id_str='task')
+
+            self.meters.update('batch_time', time.time() - timer)
+            if idx % self.args.log_freq == 0:
+                logger.log_info('step: [{0}][{1}/{2}]\tbatch-time: {meters[batch_time]:.3f}\n'
+                                '  task-{3}\t=>\t'
+                                'task-loss: {meters[task_loss]:.6f}\t'
+                                .format(epoch, idx, len(data_loader), self.args.task, meters=self.meters))
+
+            # visualization
+            if self.args.visualize and idx % self.args.visual_freq == 0:
+                self._visualize(epoch, idx, False, 
+                                func.split_tensor_tuple(inp, 0, 1, reduce_dim=True),
+                                func.split_tensor_tuple(activated_pred, 0, 1, reduce_dim=True),
+                                func.split_tensor_tuple(gt, 0, 1, reduce_dim=True))
+
+        # metrics
+        metrics_info = {'task': ''}
+        for key in sorted(list(self.meters.keys())):
+            if self.task_func.METRIC_STR in key:
+                for id_str in metrics_info.keys():
+                    if key.startswith(id_str):
+                        metrics_info[id_str] += '{0}: {1:.6}\t'.format(key, self.meters[key])
+            
+        logger.log_info('Validation metrics:\n task-metrics\t=>\t{0}\n'.format(metrics_info['task'].replace('_', '-')))
 
     def _save_checkpoint(self, epoch):
-        pass
+        state = {
+            'algorithm': self.NAME,
+            'epoch': epoch + 1,
+            'model': self.model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'lrer': self.lrer.state_dict(),
+        }
+
+        checkpoint = os.path.join(self.args.checkpoint_path, 'checkpoint_{0}.ckpt'.format(epoch))
+        torch.save(state, checkpoint)
 
     def _load_checkpoint(self):
+        checkpoint = torch.load(self.args.resume)
+
+        checkpoint_algorithm = tool.dict_value(checkpoint, 'algorithm', default='unknown')
+
+        if checkpoint_algorithm != self.NAME:
+            logger.log_err('Unmatched SSL algorithm format in checkpoint => required: {0} - given: {1}\n'
+                           .format(self.NAME, checkpoint_algorithm))
+
+        self.model.load_state_dict(checkpoint['model'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.lrer.load_state_dict(checkpoint['lrer'])
+
+        self.main_model = self.model.module.main_model
+        self.auxilary_decoders = self.model.module.auxilary_decoders
+
+        return checkpoint['epoch']
+
+    # -------------------------------------------------------------------------------------------
+    # Tool Functions for SSL_CCT
+    # -------------------------------------------------------------------------------------------
+
+    def _visualize(self, epoch, idx, is_train, inp, pred, gt):
+        visualize_path = self.args.visual_train_path if is_train else self.args.visual_val_path
+        out_path = os.path.join(visualize_path, '{0}_{1}'.format(epoch, idx))
+
+        self.task_func.visualize(out_path, id_str='task', inp=inp, pred=pred, gt=gt)
+
+    def _batch_prehandle(self, inp, gt):
+        # add extra data augmentation process here if necessary
+        
+        inp_var = []
+        for i in inp:
+            inp_var.append(Variable(i).cuda())
+        inp = tuple(inp_var)
+            
+        gt_var = []
+        for g in gt:
+            gt_var.append(Variable(g).cuda())
+        gt = tuple(gt_var)
+
+        return inp, gt
+
+    def _data_err(self):
         pass
 
     def _algorithm_warn(self):
@@ -147,14 +383,14 @@ class WrappedCCTModel(nn.Module):
         self.auxilary_decoders = auxilary_decoders
 
         self.param_groups = self.main_model.param_groups + \
-            [{'params': self.auxilary_decoders.parameters(), 'lr': self.args.lr}]   # TODO: arguments, scale lr!!!
+            [{'params': self.auxilary_decoders.parameters(), 'lr': self.args.lr * self.args.ad_lr_scale}]
 
-    def forward(self, inp):
+    def forward(self, inp, is_train):
         resulter, debugger = {}, {}
 
         m_resulter, m_debugger = self.main_model.forward(inp)
 
-        if not 'pred' in t_resulter.keys() or not 'activated_pred' in t_resulter.keys():
+        if not 'pred' in m_resulter.keys() or not 'activated_pred' in m_resulter.keys():
             logger.log_err('In SSL_CCT, the \'resulter\' dict returned by the task model should contain the following keys:\n'
                            '   (1) \'pred\'\t=>\tunactivated task predictions\n'
                            '   (2) \'activated_pred\'\t=>\tactivated task predictions\n'
@@ -164,35 +400,78 @@ class WrappedCCTModel(nn.Module):
         resulter['pred'] = tool.dict_value(m_resulter, 'pred')
         resulter['activated_pred'] = tool.dict_value(m_resulter, 'activated_pred')
 
-        if not 'sslcct_ad_inp' in m_resulter.keys():
-            logger.log_err('In SSL_CCT, the \'resulter\' dict returned by the task model should contain the key:\n'
-                           '    \'sslcct_ad_inp\'\t=>\tinputs of the auxilary_decoders (a 4-dim tensor)\n'
-                           'It is the feature map encoded by the task model\n'
-                           'Please add the key \'sslcct_ad_inp\' in your task model\'s resulter\n'
-                           'Note that for different task models, the shape of \'sslcct_ad_inp\' may be different\n')
-            
-        ad_inp = tool.dict_value(m_resulter, 'sslcct_ad_inp')
+        if not len(resulter['pred']) == len(resulter['activated_pred']) == 1:
+            logger.log_err('This implementation of SSL_CCT only support the task model with only one prediction (output). \n'
+                           'However, there are {0} predictions.\n'.format(len(resulter['pred'])))
 
-        unlabeled_ad_inp = func.split_tensor_tuple(ad_inp, self.args.labeled_batch_size, self.args.batch_size)
-        unlabeled_main_pred = func.split_tensor_tuple(resulter['pred'], self.args.labeled_batch_size, self.args.batch_size)
+        if is_train:
+            if not 'sslcct_ad_inp' in m_resulter.keys():
+                logger.log_err('In SSL_CCT, the \'resulter\' dict returned by the task model should contain the key:\n'
+                            '    \'sslcct_ad_inp\'\t=>\tinputs of the auxilary_decoders (a 4-dim tensor)\n'
+                            'It is the feature map encoded by the task model\n'
+                            'Please add the key \'sslcct_ad_inp\' in your task model\'s resulter\n'
+                            'Note that for different task models, the shape of \'sslcct_ad_inp\' may be different\n')
+                
+            ad_inp = tool.dict_value(m_resulter, 'sslcct_ad_inp')
+            main_pred = resulter['pred'][0].detach()
 
-        # TODO: warn, only support the task model with one pred!!!
-        unlabeled_ad_preds = []
-        for ad in self.auxilary_decoders:
-            unlabeled_ad_preds.append(ad.forward(unlabeled_ad_inp, pred_of_main_decoder=unlabeled_main_pred[0].detach()))
+            ad_preds = []
+            for ad in self.auxilary_decoders:
+                ad_preds.append(ad.forward(ad_inp, pred_of_main_decoder=main_pred))
 
-        resulter['unlabeled_ad_preds'] = unlabeled_ad_preds
+            resulter['ad_preds'] = ad_preds
+        else:
+            resulter['ad_preds'] = None
 
         return resulter, debugger
 
 
 # =======================================================
-# Archtectures of the Auxilary Decoders
-#   Following code is adapted form the repository:
-#       https://github.com/yassouali/CCT 
+# Following code is adapted form the repository:
+#   https://github.com/yassouali/CCT 
 # =======================================================
 
-# TODO: upscale and in_channels are the arguments of auxilary encoders, write in the task_func
+# Archtectures of the Auxilary Decoders
+
+class PixelShuffle(nn.Module):
+    """
+    Real-Time Single Image and Video Super-Resolution
+    https://arxiv.org/abs/1609.05158
+    """
+    def __init__(self, n_channels, scale):
+        super(PixelShuffle, self).__init__()
+        self.conv = nn.Conv2d(n_channels, n_channels*(scale**2), kernel_size=1)
+        self._icnr(self.conv.weight)
+        self.shuf = nn.PixelShuffle(scale)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self,x):
+        x = self.shuf(self.relu(self.conv(x)))
+        return x
+
+    def _icnr(self, x, scale=2, init=nn.init.kaiming_normal_):
+        """
+        Checkerboard artifact free sub-pixel convolution
+        https://arxiv.org/abs/1707.02937
+        """
+        ni,nf,h,w = x.shape
+        ni2 = int(ni/(scale**2))
+        k = init(torch.zeros([ni2,nf,h,w])).transpose(0, 1)
+        k = k.contiguous().view(ni2, nf, -1)
+        k = k.repeat(1, 1, scale**2)
+        k = k.contiguous().view([nf,ni,h,w]).transpose(0, 1)
+        x.data.copy_(k)
+
+
+def upsample(in_channels, out_channels, upscale, kernel_size=3):
+    # A series of x 2 upsamling until we get to the upscale we want
+    layers = []
+    conv1x1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+    nn.init.kaiming_normal_(conv1x1.weight.data, nonlinearity='relu')
+    layers.append(conv1x1)
+    for i in range(int(math.log(upscale, 2))):
+        layers.append(PixelShuffle(out_channels, scale=2))
+    return nn.Sequential(*layers)
 
 
 class VATDecoder(nn.Module):
@@ -217,7 +496,7 @@ class VATDecoder(nn.Module):
             pred = F.softmax(decoder(x_detached), dim=1)
 
         d = torch.rand(x.shape).sub(0.5).to(x.device)
-        d = _l2_normalize(d)
+        d = self._l2_normalize(d)
 
         for _ in range(it):
             d.requires_grad_()
@@ -225,11 +504,17 @@ class VATDecoder(nn.Module):
             logp_hat = F.log_softmax(pred_hat, dim=1)
             adv_distance = F.kl_div(logp_hat, pred, reduction='batchmean')
             adv_distance.backward()
-            d = _l2_normalize(d.grad)
+            d = self._l2_normalize(d.grad)
             decoder.zero_grad()
 
         r_adv = d * eps
         return r_adv
+
+    def _l2_normalize(self, d):
+        # Normalizing per batch axis
+        d_reshaped = d.view(d.shape[0], -1, *(1 for _ in range(d.dim() - 2)))
+        d /= torch.norm(d_reshaped, dim=1, keepdim=True) + 1e-8
+        return d
 
 
 class DropOutDecoder(nn.Module):
