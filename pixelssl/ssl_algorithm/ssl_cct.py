@@ -208,7 +208,7 @@ class SSLCCT(ssl_base._SSLBase):
             resulter, debugger = self.model.forward(inp, is_train=True)
             pred = tool.dict_value(resulter, 'pred')
             activated_pred = tool.dict_value(resulter, 'activated_pred')
-            ad_preds = tool.dict_value(resulter, 'ad_preds')
+            ul_ad_preds = tool.dict_value(resulter, 'ul_ad_preds')
 
             # calculate the supervised task loss on the labeled data
             l_pred = func.split_tensor_tuple(pred, 0, lbs)
@@ -227,8 +227,7 @@ class SSLCCT(ssl_base._SSLBase):
                 ul_activated_pred = func.split_tensor_tuple(activated_pred, lbs, self.args.batch_size)
                 ul_ad_gt = ul_activated_pred[0].detach()
                 # prepare the predictions from the auxilary decoders
-                ad_preds = [F.interpolate(ad_pred, size=(ul_ad_gt.shape[2], ul_ad_gt.shape[3]), mode='bilinear') for ad_pred in ad_preds]
-                ul_ad_preds = func.split_tensor_tuple(ad_preds, lbs, self.args.batch_size)
+                ul_ad_preds = [F.interpolate(ul_ad_pred, size=(ul_ad_gt.shape[2], ul_ad_gt.shape[3]), mode='bilinear') for ul_ad_pred in ul_ad_preds]
                 ul_activated_ad_preds = self.task_func.sslcct_activate_ad_preds(ul_ad_preds)
                 # calculate the consisntecy loss
                 cons_loss = sum([self.cons_criterion.forward(ul_activated_ad_pred, ul_ad_gt) for ul_activated_ad_pred in ul_activated_ad_preds])
@@ -404,7 +403,7 @@ class WrappedCCTModel(nn.Module):
             logger.log_err('This implementation of SSL_CCT only support the task model with only one prediction (output). \n'
                            'However, there are {0} predictions.\n'.format(len(resulter['pred'])))
 
-        if is_train:
+        if is_train and self.args.unlabeled_batch_size > 0:
             if not 'sslcct_ad_inp' in m_resulter.keys():
                 logger.log_err('In SSL_CCT, the \'resulter\' dict returned by the task model should contain the key:\n'
                             '    \'sslcct_ad_inp\'\t=>\tinputs of the auxilary_decoders (a 4-dim tensor)\n'
@@ -413,15 +412,16 @@ class WrappedCCTModel(nn.Module):
                             'Note that for different task models, the shape of \'sslcct_ad_inp\' may be different\n')
                 
             ad_inp = tool.dict_value(m_resulter, 'sslcct_ad_inp')
-            main_pred = resulter['pred'][0].detach()
+            ul_ad_inp = ad_inp[self.args.labeled_batch_size:, ...]
+            ul_main_pred = resulter['pred'][0][self.args.labeled_batch_size:, ...].detach()
 
-            ad_preds = []
+            ul_ad_preds = []
             for ad in self.auxilary_decoders:
-                ad_preds.append(ad.forward(ad_inp, pred_of_main_decoder=main_pred))
+                ul_ad_preds.append(ad.forward(ul_ad_inp, pred_of_main_decoder=ul_main_pred))
 
-            resulter['ad_preds'] = ad_preds
+            resulter['ul_ad_preds'] = ul_ad_preds
         else:
-            resulter['ad_preds'] = None
+            resulter['ul_ad_preds'] = None
 
         return resulter, debugger
 
